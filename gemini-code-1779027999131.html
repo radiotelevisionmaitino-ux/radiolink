@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>stream.mp3</title>
+
+    <style>
+        /* Estilos simulando un entorno de enlace de audio puro en el navegador */
+        body { 
+            background-color: #000000; 
+            margin: 0; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            justify-content: center; 
+            min-height: 100vh; 
+            overflow: hidden; 
+        }
+        
+        /* Dimensiones típicas del reproductor nativo de Chromium/Webkit */
+        #native-ui {
+            width: 300px;
+            height: 54px;
+            outline: none;
+        }
+
+        /* Oculta toda la interfaz y gráficos, dejando solo el motor vivo */
+        .engine-core {
+            display: none !important;
+        }
+    </style>
+</head>
+
+<body>
+    <audio id="native-ui" controls controlsList="nodownload"></audio>
+
+    <div class="engine-core">
+        <div id="tally"></div>
+        <div id="status-badge"></div>
+        <h2 id="main-title"></h2>
+        <p id="sub-title"></p>
+        <img id="art-img">
+        <canvas id="visualizer-canvas" width="140" height="60"></canvas>
+        <div id="clock"></div>
+        <button id="pwr-btn"></button>
+        <div id="schedule-list"></div>
+        <audio id="deck-a" preload="metadata" playsinline crossorigin="anonymous"></audio>
+        <audio id="deck-b" preload="metadata" playsinline crossorigin="anonymous"></audio>
+    </div>
+
+    <script>
+        // ==========================================
+        // LÓGICA ORIGINAL DEL MOTOR DE RADIO MAITINO
+        // ==========================================
+        const CONFIG = {
+            api: "https://script.google.com/macros/s/AKfycbzoQfFFkwSOoZlnX73FKn8lEtbcRSEe6CYXPeuZ6tZPG5OsBuXivvvGtBJhGJhPC7GU/exec",
+            crossfadeDur: 3, pollInterval: 30,
+            defaultLogo: "https://ia600602.us.archive.org/32/items/r-maitino-psd-1400.1400/r%20maitino%20psd%201400.1400.png"
+        };
+        const SILENCE_MP3 = "data:audio/mpeg;base64,SUQzBAAAAAABEVRYWFgAAAAtAAADY29tbWVudABpRDIzIHYyLjMuMCBhbmQgaWQzIHYyLjQuMCB0YWdzAAAAAAAAAAAA//MkxAAKAAAABpAAAAWSAAAAASU1BTUUzLjk5LjVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV";
+
+        let systemOn = false, userVolume = 0.9, faderLevel = 1.0, currentSourceUrl = "", currentMode = 'FILLER';
+        let deckA = document.getElementById('deck-a'), deckB = document.getElementById('deck-b');
+        let activeDeck = deckA, fadingDeck = null, fadeOutEndTime = 0, isTransitioning = false; 
+        let isDataLoaded = false;
+        let visStartTime = Date.now(); 
+        
+        let library = { news: null, chimes: null, weather: null, hours: {}, breaking: null, ads: [], jingles: [], spaces: [], promos: [], filler: [], schedule: {0:[],1:[],2:[],3:[],4:[],5:[],6:[]}, scheduleDates: {} };
+        let audioCtx, masterCompressor, lastPipFired = -1;
+        let lastScore = "", lastClockSec = -1, lastScheduleSec = -1; 
+
+        // MOTOR DE LOCUCIÓN INTEGRADO (TTS)
+        const synth = window.speechSynthesis;
+        let currentUtterance;
+        let isTtsActive = false;
+        let ttsGuionText = "Cargando servicio meteorológico de Radio Maitino...";
+        let currentSourceItemDuration = 60;
+        let voices = [];
+
+        function loadVoices() { if (synth) voices = synth.getVoices(); }
+        loadVoices();
+        if (synth && speechSynthesis.onvoiceschanged !== undefined) {
+            speechSynthesis.onvoiceschanged = loadVoices;
+        }
+
+        const el = {
+            clock: document.getElementById('clock'), title: document.getElementById('main-title'), sub: document.getElementById('sub-title'), 
+            img: document.getElementById('art-img'), badge: document.getElementById('status-badge'), tally: document.getElementById('tally'),
+            btn: document.getElementById('pwr-btn'), sch: document.getElementById('schedule-list'), canvas: document.getElementById('visualizer-canvas')
+        };
+
+        function safePlay(audioElem) {
+            if (!audioElem || !audioElem.src || audioElem.src === window.location.href) return;
+            let playPromise = audioElem.play();
+            if (playPromise !== undefined) {
+                playPromise.catch(err => {
+                    console.warn("Autoplay bloqueado o enlace lento. Reintentando...", err);
+                    setTimeout(() => { 
+                        if (systemOn && audioElem.paused) {
+                            audioElem.load(); 
+                            audioElem.play().catch(e=>console.error("Fallo definitivo de enlace:", audioElem.src)); 
+                        }
+                    }, 1000);
+                });
+            }
+        }
+
+        function updateBtnState() {
+            if (!systemOn) el.btn.innerHTML = '<i class="fas fa-power-off"></i>';
+            else if (activeDeck.src && (activeDeck.readyState < 3 && !activeDeck.paused) && !['ESTUDIO_LIVE', 'LIVE', 'BREAKINGLIVE'].includes(currentMode)) el.btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            else el.btn.innerHTML = '<i class="fas fa-stop"></i>';
+        }
+
+        [deckA, deckB].forEach(d => { 
+            ['waiting','playing','canplay','stalled'].forEach(e => d.addEventListener(e, updateBtnState)); 
+            d.addEventListener('play', () => { if (isTtsActive && d === activeDeck) startTtsVoice(); });
+            d.addEventListener('pause', () => { if (isTtsActive) synth.pause(); });
+            d.addEventListener('seeked', () => { if (isTtsActive && d === activeDeck) startTtsVoice(); });
+        });
+
+        function getSpainTime() {
+            let now = new Date();
+            let pts = new Intl.DateTimeFormat('en-US', { timeZone: 'Europe/Madrid', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false }).formatToParts(now);
+            let v = {}; pts.forEach(p => v[p.type] = p.value);
+            return new Date(v.year, v.month - 1, v.day, (v.hour === "24" ? 0 : v.hour), v.minute, v.second, now.getMilliseconds());
+        }
+
+        async function initSystem() {
+            await fetchData(); 
+            await fetchTtsWeatherData();
+            setInterval(fetchData, CONFIG.pollInterval * 1000); 
+        }
+
+        async function fetchData() {
+            try { 
+                let res = await fetch(CONFIG.api, { redirect: 'follow' }); 
+                let data = await res.json(); 
+                processData(data); 
+                isDataLoaded = true; 
+                updateScheduleUI(); 
+                fetchTtsWeatherData(); 
+            } catch (e) { 
+                console.log("API Sync Error"); 
+            }
+        }
+
+        function createSilentWavUrl(durationSec) {
+            const sampleRate = 8000;
+            const numSamples = Math.floor(durationSec * sampleRate);
+            const buffer = new ArrayBuffer(44 + numSamples * 2);
+            const view = new DataView(buffer);
+            const writeString = (offset, string) => {
+                for (let i = 0; i < string.length; i++) { view.setUint8(offset + i, string.charCodeAt(i)); }
+            };
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + numSamples * 2, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeString(36, 'data');
+            view.setUint32(40, numSamples * 2, true);
+            const blob = new Blob([buffer], { type: 'audio/wav' });
+            return URL.createObjectURL(blob);
+        }
+
+        async function fetchTtsWeatherData() {
+            try {
+                const res = await fetch('https://wttr.in/Maitino?format=j1&lang=es');
+                const data = await res.json();
+                const current = data.current_condition[0];
+                const today = data.weather[0];
+                const tomorrow = data.weather[1];
+                const day3 = data.weather[2];
+                const ahora = getSpainTime();
+                const hour = ahora.getHours();
+                const mins = ahora.getMinutes().toString().padStart(2, '0');
+                const dateStr = ahora.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+
+                let faseDia = (hour >= 20 || hour < 6) ? "la noche" : (hour < 13) ? "la mañana" : "la tarde";
+                let horaIndex = (hour >= 20 || hour < 2) ? 7 : (hour < 7) ? 1 : (hour < 13) ? 3 : 5;
+
+                const condProximasHoras = today.hourly[horaIndex].lang_es[0].value.toLowerCase();
+                const probLluviaHoras = today.hourly[horaIndex].chanceofrain;
+                const precipHoy = current.precipMM;
+
+                const condManana = tomorrow.hourly[4].lang_es[0].value.toLowerCase();
+                const probLluviaManana = tomorrow.hourly[4].chanceofrain;
+
+                const nextDayDate = new Date(ahora.getTime() + 86400000 * 2);
+                const nameDay3 = nextDayDate.toLocaleDateString('es-ES', { weekday: 'long' });
+                const condDay3 = day3.hourly[4].lang_es[0].value.toLowerCase();
+                const probLluviaDay3 = day3.hourly[4].chanceofrain;
+
+                ttsGuionText = `SERVICIO METEOROLÓGICO DE RADIO MAITINO. Boletín actualizado para hoy, ${dateStr}. Son las ${hour} horas y ${mins} minutos. En este momento, los cielos se presentan ${current.lang_es[0].value.toLowerCase()}s. Los termómetros registran ${current.temp_C} grados, el viento se sitúa en ${current.windspeedKmph} kilómetros por hora y la sensación térmica es de ${current.FeelsLikeC} grados. Humedad del ${current.humidity} por ciento y precipitación acumulada de ${precipHoy} milímetros. De cara a las próximas horas de ${faseDia}, el pronóstico indica condiciones de ${condProximasHoras} con una probabilidad de lluvia del ${probLluviaHoras} por ciento. Las temperaturas alcanzarán hoy un máximo de ${today.maxtempC} grados. Para mañana: prevemos un escenario dominado por ${condManana} con temperaturas entre ${tomorrow.mintempC} y ${tomorrow.maxtempC} grados, y una probabilidad de precipitación del ${probLluviaManana} por ciento. Próximo ${nameDay3}: cielos ${condDay3}s, temperaturas de ${day3.mintempC} a ${day3.maxtempC} grados, y un ${probLluviaDay3} por ciento de probabilidad de lluvia. Es una información de la Agencia Meteorológica de Maitino.`;
+            } catch (e) {
+                console.log("Error al procesar boletín de voz");
+            }
+        }
+
+        function startTtsVoice() {
+            if (!synth || !isTtsActive || !systemOn) return;
+            synth.cancel();
+            if (activeDeck.paused) return;
+
+            const progreso = activeDeck.currentTime / currentSourceItemDuration;
+            const inicioChar = Math.floor(ttsGuionText.length * progreso);
+            const textoRestante = ttsGuionText.substring(inicioChar);
+
+            if (!textoRestante.trim()) return;
+
+            currentUtterance = new SpeechSynthesisUtterance(textoRestante);
+            const googleVoice = voices.find(v => v.name.includes('Google') && v.lang.includes('es-ES')) || voices.find(v => v.lang.includes('es-ES')) || voices[0];
+            if (googleVoice) currentUtterance.voice = googleVoice;
+
+            const tiempoRestante = Math.max(1, currentSourceItemDuration - activeDeck.currentTime);
+            const duracionBase = textoRestante.length / 14;
+            let dynamicRate = duracionBase / tiempoRestante;
+            dynamicRate = Math.max(0.85, Math.min(1.25, dynamicRate));
+
+            currentUtterance.rate = dynamicRate;
+            currentUtterance.pitch = 1.0;
+            currentUtterance.volume = Math.max(0, Math.min(1, userVolume * faderLevel));
+
+            synth.speak(currentUtterance);
+        }
+
+        function addToSchedule(item) {
+            let s1 = String(item.dayRaw || "").trim();
+            let s2 = String(item.hourRaw || "").trim(); 
+            let startSecs = -1;
+            let m = s2.match(/^(\d{1,2}):(\d{2})/);
+            if (m) startSecs = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60;
+            if(startSecs === -1) return;
+            
+            item.startSecs = startSecs;
+
+            if (s1.includes('/')) {
+                let parts = s1.split('/');
+                if (parts.length === 3) {
+                    let y = parts[2].length === 2 ? "20" + parts[2] : parts[2];
+                    let normDate = parseInt(parts[0], 10) + "/" + parseInt(parts[1], 10) + "/" + y;
+                    if(!library.scheduleDates) library.scheduleDates = {};
+                    if(!library.scheduleDates[normDate]) library.scheduleDates[normDate] = [];
+                    library.scheduleDates[normDate].push(item);
+                }
+                return; 
+            }
+
+            let days = []; 
+            if (s1 && s1.toLowerCase() !== "null") {
+                s1.split(',').forEach(p => { 
+                    if (p.includes('-')) { let l = p.split('-'); for (let i = parseInt(l[0]); i <= parseInt(l[1]); i++) days.push(i); } 
+                    else { days.push(parseInt(p)); } 
+                });
+            }
+            if (days.length === 0) days = [0, 1, 2, 3, 4, 5, 6]; 
+            
+            [...new Set(days)].forEach(d => { if(library.schedule[d]) library.schedule[d].push(item); });
+        }
+
+        function processData(data) {
+            library = { news: null, chimes: null, weather: null, hours: {}, breaking: null, ads: [], jingles: [], spaces: [], promos: [], filler: [], schedule: {0:[],1:[],2:[],3:[],4:[],5:[],6:[]}, scheduleDates: {} };
+            data.forEach(row => {
+                if (!row.type || String(row.type).trim() === "") return;
+                
+                let item = { src: parseLink(row.src), title: row.title || "Emisión", artist: row.artist || "Radio Maitino", img: row.image || "", dur: parseInt(row.duration) || 300, type: row.type.toLowerCase().replace(/\s+/g, ''), dayRaw: row.day, hourRaw: row.hour };
+                let t = item.type;
+
+                if (t === 'news') library.news = item; 
+                else if (t === 'weather') library.weather = item;
+                else if (t === 'chimes') library.chimes = item;
+                else if (t === 'space' && !item.hourRaw) library.spaces.push(item);
+                else if (t === 'hour') { let m = String(item.hourRaw||"").trim().match(/^(\d{1,2}):(\d{2})/); if(m) library.hours[parseInt(m[1], 10)] = item; else library.hours['default'] = item; } 
+                else if (['breaking', 'breakinglive', 'estudiolive', 'emergency'].includes(t)) {
+                    if (item.dayRaw || item.hourRaw) { item.type = t === 'emergency' ? 'emergency' : 'estudio_live_scheduled'; addToSchedule(item); } 
+                    else { item.type = t === 'emergency' ? 'emergency' : (t.includes('estudio') ? 'estudio_live_breaking' : (t === 'breakinglive' ? 'breakinglive' : 'breaking')); library.breaking = item; }
+                }
+                else if (t === 'jingle') library.jingles.push(item); else if (t === 'ad') library.ads.push(item);
+                else if (t === 'promo') library.promos.push(item);
+                else if (['schedule', 'live', 'podcast', 'interview', 'off', 'sports'].includes(t)) {
+                    if (item.dayRaw || item.hourRaw) addToSchedule(item); else library.filler.push(item);
+                } else { library.filler.push(item); }
+            });
+        }
+
+        function parseLink(url) { if (!url) return ""; return url.trim(); }
+
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new(window.AudioContext || window.webkitAudioContext)();
+                
+                masterCompressor = audioCtx.createDynamicsCompressor();
+                masterCompressor.threshold.value = -18; 
+                masterCompressor.knee.value = 15; 
+                masterCompressor.ratio.value = 3; 
+                masterCompressor.attack.value = 0.05; 
+                masterCompressor.release.value = 0.25; 
+                masterCompressor.connect(audioCtx.destination);
+
+                try {
+                    let srcA = audioCtx.createMediaElementSource(deckA);
+                    let srcB = audioCtx.createMediaElementSource(deckB);
+                    srcA.connect(masterCompressor);
+                    srcB.connect(masterCompressor);
+                } catch(e) { 
+                    console.log("CORS bypass active"); 
+                }
+                requestAnimationFrame(drawVisualizer);
+            }
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+        }
+
+        function drawVisualizer() {
+            if (!systemOn) return; requestAnimationFrame(drawVisualizer);
+            // Función preservada internamente aunque no se muestre visualmente.
+        }
+
+        function playPip(dur) {
+            if (!audioCtx) return;
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            let t = audioCtx.currentTime;
+            let osc = audioCtx.createOscillator(), pGain = audioCtx.createGain();
+            osc.type = 'sine'; osc.frequency.value = 1000; 
+            osc.connect(pGain); 
+            pGain.connect(audioCtx.destination); 
+            let pipVolume = userVolume * 0.5; 
+            pGain.gain.setValueAtTime(0, t);
+            pGain.gain.setValueAtTime(pipVolume, t + 0.001);
+            pGain.gain.setValueAtTime(pipVolume, t + dur - 0.001);
+            pGain.gain.setValueAtTime(0, t + dur);
+            osc.start(t); osc.stop(t + dur + 0.01);
+        }
+
+        function gestionarPips(m, s) {
+            let isApproachingHour = (m === 59 || m === 29);
+            if (!isApproachingHour && !(m === 0 || m === 30)) { lastPipFired = -1; return; }
+            if (isApproachingHour && s >= 55 && s <= 59) {
+                if (lastPipFired !== s) { lastPipFired = s; playPip(0.1); }
+            } else if ((m === 0 || m === 30) && s === 0) {
+                if (lastPipFired !== s) { lastPipFired = s; playPip(0.5); }
+            }
+        }
+
+        let broadcastLoopTimer = null;
+        function toggleBroadcast() {
+            if (!systemOn) {
+                initAudio(); 
+                visStartTime = Date.now(); 
+                deckA.src = SILENCE_MP3; safePlay(deckA); deckB.src = SILENCE_MP3; safePlay(deckB);
+                systemOn = true; el.btn.classList.add('active'); el.tally.classList.add('live'); updateBtnState(); requestAnimationFrame(visualLoop); 
+                function loop() { if (systemOn) { broadcastLogic(); broadcastLoopTimer = setTimeout(loop, 50); } }
+                loop();
+            } else {
+                systemOn = false; el.btn.classList.remove('active'); el.tally.classList.remove('live'); updateBtnState();
+                clearTimeout(broadcastLoopTimer);
+                if (synth) synth.cancel();
+                isTtsActive = false;
+                activeDeck.pause(); activeDeck.removeAttribute('src'); activeDeck.load();
+                if (fadingDeck) { fadingDeck.pause(); fadingDeck.removeAttribute('src'); fadingDeck.load(); fadingDeck = null; }
+                currentSourceUrl = ""; 
+                updateDisplay({ title: "Emisión Detenida", artist: "Off Air", img: "" }, '<i class="fas fa-power-off"></i> OFF', "status-badge off");
+                let ctx = el.canvas.getContext('2d');
+                if(ctx) ctx.clearRect(0, 0, el.canvas.width, el.canvas.height);
+            }
+        }
+
+        function broadcastLogic() {
+            if (!systemOn) return;
+            const now = getSpainTime(), d = now.getDay(), h = now.getHours(), m = now.getMinutes(), s = now.getSeconds(), ms = now.getMilliseconds();
+            const secInDay = h * 3600 + m * 60 + s, secInHour = m * 60 + s;
+            
+            gestionarFaders(m, s, ms); gestionarPips(m, s);
+
+            if (s === lastScheduleSec) return;
+            lastScheduleSec = s;
+
+            let nextItem = null, seekPos = 0, mode = 'FILLER';
+            let curH = (h === 0) ? library.chimes : (library.hours[h] || library.hours['default']);
+            
+            let tohSeq = [];
+            if (curH) tohSeq.push({...curH, computedMode: 'HOUR'});
+            if (library.news) tohSeq.push({...library.news, computedMode: 'NEWS'});
+            if (library.weather) tohSeq.push({...library.weather, computedMode: 'WEATHER'}); 
+
+            let transSeq = [];
+            let rawTrans = [];
+            library.spaces.forEach(x => rawTrans.push(x));
+            library.promos.forEach(x => rawTrans.push(x));
+            library.ads.forEach(x => rawTrans.push(x));
+            if (library.jingles.length > 0) rawTrans.push(library.jingles[h % library.jingles.length]);
+
+            let seed = h + (d * 24);
+            function sRand() { let x = Math.sin(seed++) * 10000; return x - Math.floor(x); }
+            rawTrans.sort(() => sRand() - 0.5);
+
+            for (let i = 0; i < rawTrans.length; i++) {
+                transSeq.push({...rawTrans[i], computedMode: rawTrans[i].type.toUpperCase()});
+                let sDur = sRand() > 0.5 ? 2 : 1;
+                transSeq.push({ src: SILENCE_MP3, title: "Radio Maitino", artist: "Radio Maitino", img: CONFIG.defaultLogo, type: "filler", dur: sDur, computedMode: 'FILLER' });
+            }
+            
+            tohSeq.push(...transSeq);
+            let blockDur = tohSeq.reduce((a, b) => a + Math.max(1, b.dur), 0);
+
+            let normToday = now.getDate() + "/" + (now.getMonth() + 1) + "/" + now.getFullYear();
+            let specificDateShows = library.scheduleDates ? (library.scheduleDates[normToday] || []) : [];
+            let scheduledShow = specificDateShows.find(sh => secInDay >= sh.startSecs && secInDay < sh.startSecs + sh.dur);
+            
+            if (!scheduledShow) {
+                scheduledShow = (library.schedule[d] || []).find(sh => secInDay >= sh.startSecs && secInDay < sh.startSecs + sh.dur);
+            }
+
+            if (library.breaking) {
+                if (library.breaking.type === 'estudio_live_breaking') { nextItem = library.breaking; mode = 'ESTUDIO_LIVE'; seekPos = 0; } 
+                else if (library.breaking.type === 'breakinglive') { nextItem = library.breaking; mode = 'BREAKINGLIVE'; seekPos = 0; } 
+                else { nextItem = library.breaking; seekPos = (Math.floor(Date.now() / 1000)) % Math.max(1, library.breaking.dur); mode = 'BREAKING'; }
+            }
+            else if (secInHour < blockDur) {
+                let c = secInHour;
+                for (let itm of tohSeq) { 
+                    let idur = Math.max(1, itm.dur);
+                    if (c < idur) { nextItem = itm; seekPos = c; mode = itm.computedMode; break; } 
+                    c -= idur; 
+                }
+            }
+            else if (scheduledShow) {
+                let delay = (scheduledShow.startSecs % 3600 === 0) ? blockDur : 0;
+                nextItem = scheduledShow; 
+                seekPos = Math.max(0, (secInDay - scheduledShow.startSecs) - delay); 
+                if (scheduledShow.type.includes('estudio')) mode = 'ESTUDIO_LIVE';
+                else if (scheduledShow.type === 'sports') mode = 'SPORTS';
+                else if (scheduledShow.type.includes('live')) mode = 'LIVE';
+                else mode = 'SHOW';
+            }
+            else {
+                mode = 'FILLER'; let seq = []; library.filler.forEach((f, idx) => { seq.push(f); if (idx % 2 === 0 && library.jingles.length > 0) seq.push(library.jingles[idx % library.jingles.length]); });
+                if (seq.length > 0) {
+                    let total = seq.reduce((a, b) => a + Math.max(1, b.dur), 0), c = secInDay % (total || 1);
+                    for (let itm of seq) { let idur = Math.max(1, itm.dur); if (c < idur) { nextItem = itm; seekPos = c; break; } c -= idur; }
+                }
+            }
+
+            if (!isDataLoaded) { nextItem = { src: SILENCE_MP3, title: "Conectando...", artist: "Sintonizando emisión...", img: CONFIG.defaultLogo, type: "loading", dur: 300 }; mode = 'LOADING'; }
+            else if (!nextItem) { nextItem = { src: SILENCE_MP3, title: "Emisión Continuada", artist: "Silencio", img: CONFIG.defaultLogo, type: "off", dur: 300 }; mode = 'OFF'; }
+
+            currentMode = mode; if (nextItem) ejecutarAudio(nextItem, seekPos, mode);
+        }
+
+        function gestionarFaders(m, s, ms) {
+            let e = s + (ms / 1000);
+            if (m === 59) { 
+                if (e >= 52 && e < 59) faderLevel = 1.0 - ((e - 52) / 7); 
+                else if (e >= 59) { faderLevel = 0.0; if (!activeDeck.paused && !['LIVE','ESTUDIO_LIVE','NEWS','SPORTS','BREAKINGLIVE'].includes(currentMode)) activeDeck.pause(); } 
+                else faderLevel = 1.0;
+            } 
+            else if (m === 29 && e >= 55) faderLevel = 1.0 - (0.4 * ((e - 55) / 5)); 
+            else if (m === 30 && e < 3) faderLevel = 0.6 + (0.4 * (e / 3)); 
+            else faderLevel = 1.0;
+
+            let bv = userVolume * faderLevel;
+            let ns = Date.now() / 1000;
+            let ad = (activeDeck === deckA) ? deckA : deckB;
+            let fd = (fadingDeck === deckA) ? deckA : deckB;
+            
+            if (fadingDeck) {
+                let fr = fadeOutEndTime - ns;
+                if (fr <= 0 || faderLevel === 0.0) { fadingDeck.pause(); fadingDeck.removeAttribute('src'); fadingDeck = null; fd.volume = 0; ad.volume = Math.max(0, Math.min(1, bv)); } 
+                else { let r = fr / CONFIG.crossfadeDur; fd.volume = Math.max(0, Math.min(1, bv * r)); ad.volume = Math.max(0, Math.min(1, bv * (1 - r))); }
+            } else { ad.volume = Math.max(0, Math.min(1, bv)); }
+        }
+
+        function updateDisplay(item, badgeHtml, badgeClass) {
+            // Se mantienen las asignaciones para no romper funciones de lógica de datos.
+            el.title.innerText = item.title;
+            el.sub.innerText = item.artist;
+        }
+
+        function ejecutarAudio(item, seek, mode) {
+            let safeMode = mode.toUpperCase();
+            
+            if (currentSourceUrl !== item.src) {
+                currentSourceUrl = item.src; 
+                isTransitioning = true;
+                
+                if (synth) synth.cancel();
+                isTtsActive = false;
+
+                fadingDeck = activeDeck; 
+                activeDeck = (activeDeck === deckA) ? deckB : deckA;
+                
+                currentSourceItemDuration = Math.max(1, item.dur || 60);
+
+                if (item.src.includes('github.io') || item.src.includes('.html') || safeMode === 'WEATHER') {
+                    isTtsActive = true;
+                    activeDeck.src = createSilentWavUrl(currentSourceItemDuration);
+                } else {
+                    activeDeck.src = item.src;
+                }
+                
+                let rt = Date.now() / 1000;
+                let isStream = ['LIVE','ESTUDIO_LIVE','SPORTS','BREAKINGLIVE'].includes(safeMode);
+                
+                activeDeck.onloadedmetadata = () => { 
+                    let adj = seek + ((Date.now() / 1000) - rt); 
+                    if (!isStream && adj > 2 && (!activeDeck.duration || adj < activeDeck.duration)) {
+                        try { activeDeck.currentTime = adj; } catch(e) { console.warn("Seek lock bypass."); }
+                    }
+                };
+                
+                activeDeck.oncanplay = () => { 
+                    isTransitioning = false; 
+                    if (safeMode === 'NEWS') { fadeOutEndTime = Date.now() / 1000; } 
+                    else { fadeOutEndTime = (Date.now() / 1000) + CONFIG.crossfadeDur; }
+                    safePlay(activeDeck); 
+                    if (isTtsActive) startTtsVoice(); 
+                };
+
+                activeDeck.onerror = () => { isTransitioning = false; };
+                activeDeck.load();
+                updateDisplay(item, safeMode, `status-badge ${item.type || safeMode.toLowerCase()}`);
+            } else {
+                let isStream = ['LIVE','ESTUDIO_LIVE','SPORTS','BREAKINGLIVE'].includes(safeMode);
+                if (activeDeck.readyState >= 3 && !isStream) {
+                    if (Math.abs(activeDeck.currentTime - seek) > 15) { try { activeDeck.currentTime = seek; } catch(e) {} }
+                }
+                if (activeDeck.paused && systemOn && !isTransitioning) safePlay(activeDeck);
+            }
+        }
+
+        function updateScheduleUI() {
+           // Mantiene la actualización lógica para evitar errores silenciosos
+        }
+
+        function visualLoop() { 
+            if (systemOn) { 
+                let t = getSpainTime(), ssNum = t.getSeconds();
+                if (ssNum !== lastClockSec) { lastClockSec = ssNum; }
+                requestAnimationFrame(visualLoop); 
+            } 
+        }
+
+        initSystem();
+
+
+        // ==========================================================
+        // PUENTE AL REPRODUCTOR NATIVO SIMULANDO ENLACE DIRECTO MP3
+        // ==========================================================
+        const uiPlayer = document.getElementById('native-ui');
+        uiPlayer.volume = 0.9; 
+        
+        // Creamos un stream falso a través del Web Audio API. 
+        // Genera silencio para que el navegador lo reconozca como un entorno de "Transmisión en directo" (Live)
+        let dummyCtx = new (window.AudioContext || window.webkitAudioContext)();
+        let streamDest = dummyCtx.createMediaStreamDestination();
+        let osc = dummyCtx.createOscillator();
+        let gain = dummyCtx.createGain();
+        gain.gain.value = 0; // Volumen 0 absoluto
+        osc.connect(gain);
+        gain.connect(streamDest);
+        osc.start();
+        
+        if ('srcObject' in uiPlayer) {
+            uiPlayer.srcObject = streamDest.stream; // Forzamos el aspecto de un enlace streaming
+        } else {
+            uiPlayer.src = SILENCE_MP3;
+            uiPlayer.loop = true;
+        }
+
+        // Interceptamos la interacción del usuario en la pantalla negra
+        uiPlayer.addEventListener('play', () => {
+            if (dummyCtx.state === 'suspended') dummyCtx.resume();
+            
+            // Si el motor interno estaba apagado, encendemos toda la radio
+            if (!systemOn) toggleBroadcast();
+        });
+
+        uiPlayer.addEventListener('pause', () => {
+            // Si el usuario pausa en la web negra, apagamos la radio de verdad
+            if (systemOn) toggleBroadcast();
+        });
+
+        uiPlayer.addEventListener('volumechange', () => {
+            // Enlazamos el regulador de volumen del reproductor nativo con el Master del código
+            userVolume = uiPlayer.muted ? 0 : uiPlayer.volume;
+            
+            // Aplicamos este impacto instantáneamente para reaccionar antes del bucle regular
+            let instantVol = userVolume * faderLevel;
+            deckA.volume = Math.max(0, Math.min(1, instantVol));
+            deckB.volume = Math.max(0, Math.min(1, instantVol));
+        });
+
+    </script>
+</body>
+</html>
