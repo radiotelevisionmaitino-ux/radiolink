@@ -9,14 +9,14 @@
     <style>
         /* Estilos simulando un entorno de enlace de audio puro en el navegador */
         body { 
-            background-color: #000000; 
-            margin: 0; 
-            display: flex; 
-            flex-direction: column; 
-            align-items: center; 
-            justify-content: center; 
-            min-height: 100vh; 
-            overflow: hidden; 
+            background-color: #000000; \
+            margin: 0; \
+            display: flex; \
+            flex-direction: column; \
+            align-items: center; \
+            justify-content: center; \
+            min-height: 100vh; \
+            overflow: hidden; \
         }
         
         /* Dimensiones típicas del reproductor nativo de Chromium/Webkit */
@@ -62,6 +62,7 @@
         const SILENCE_MP3 = "data:audio/mpeg;base64,SUQzBAAAAAABEVRYWFgAAAAtAAADY29tbWVudABpRDIzIHYyLjMuMCBhbmQgaWQzIHYyLjQuMCB0YWdzAAAAAAAAAAAA//MkxAAKAAAABpAAAAWSAAAAASU1BTUUzLjk5LjVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV";
 
         let systemOn = false, userVolume = 0.9, faderLevel = 1.0, currentSourceUrl = "", currentMode = 'FILLER';
+        let currentCrossfade = CONFIG.crossfadeDur;
         let deckA = document.getElementById('deck-a'), deckB = document.getElementById('deck-b');
         let activeDeck = deckA, fadingDeck = null, fadeOutEndTime = 0, isTransitioning = false; 
         let isDataLoaded = false;
@@ -227,7 +228,8 @@
 
             currentUtterance.rate = dynamicRate;
             currentUtterance.pitch = 1.0;
-            currentUtterance.volume = Math.max(0, Math.min(1, userVolume * faderLevel));
+            // Impulso de volumen adaptado para equilibrar el boletín regulado
+            currentUtterance.volume = Math.max(0, Math.min(1, userVolume * faderLevel * 1.5));
 
             synth.speak(currentUtterance);
         }
@@ -320,7 +322,6 @@
 
         function drawVisualizer() {
             if (!systemOn) return; requestAnimationFrame(drawVisualizer);
-            // Función preservada internamente aunque no se muestre visualmente.
         }
 
         function playPip(dur) {
@@ -403,7 +404,7 @@
 
             for (let i = 0; i < rawTrans.length; i++) {
                 transSeq.push({...rawTrans[i], computedMode: rawTrans[i].type.toUpperCase()});
-                let sDur = sRand() > 0.5 ? 2 : 1;
+                let sDur = 2; // MODIFICACIÓN: Respetar silencios fijos de 2 segundos en bloques
                 transSeq.push({ src: SILENCE_MP3, title: "Radio Maitino", artist: "Radio Maitino", img: CONFIG.defaultLogo, type: "filler", dur: sDur, computedMode: 'FILLER' });
             }
             
@@ -416,6 +417,15 @@
             
             if (!scheduledShow) {
                 scheduledShow = (library.schedule[d] || []).find(sh => secInDay >= sh.startSecs && secInDay < sh.startSecs + sh.dur);
+            }
+
+            // MODIFICACIÓN: Si a las 00:00 empieza Live, Sports o Estudio, se arranca en limpio desde cero absoluto
+            let isTopHourLive = scheduledShow && (scheduledShow.startSecs % 3600 === 0) && 
+                                (scheduledShow.type.includes('live') || scheduledShow.type === 'sports' || scheduledShow.type.includes('estudio'));
+            
+            if (isTopHourLive) {
+                tohSeq = []; 
+                blockDur = 0;
             }
 
             if (library.breaking) {
@@ -473,12 +483,11 @@
             if (fadingDeck) {
                 let fr = fadeOutEndTime - ns;
                 if (fr <= 0 || faderLevel === 0.0) { fadingDeck.pause(); fadingDeck.removeAttribute('src'); fadingDeck = null; fd.volume = 0; ad.volume = Math.max(0, Math.min(1, bv)); } 
-                else { let r = fr / CONFIG.crossfadeDur; fd.volume = Math.max(0, Math.min(1, bv * r)); ad.volume = Math.max(0, Math.min(1, bv * (1 - r))); }
+                else { let r = fr / currentCrossfade; fd.volume = Math.max(0, Math.min(1, bv * r)); ad.volume = Math.max(0, Math.min(1, bv * (1 - r))); }
             } else { ad.volume = Math.max(0, Math.min(1, bv)); }
         }
 
         function updateDisplay(item, badgeHtml, badgeClass) {
-            // Se mantienen las asignaciones para no romper funciones de lógica de datos.
             el.title.innerText = item.title;
             el.sub.innerText = item.artist;
         }
@@ -517,8 +526,18 @@
                 
                 activeDeck.oncanplay = () => { 
                     isTransitioning = false; 
+
+                    // MODIFICACIÓN: Fundidos mínimos para jingles, publicidad o pausas mudas de bloque para no recortar pistas
+                    if (['JINGLE', 'AD', 'SPACE', 'PROMO'].includes(safeMode) || currentSourceItemDuration <= 5) {
+                        currentCrossfade = 0.5; 
+                    } else if (item.src === SILENCE_MP3) {
+                        currentCrossfade = 0.2; 
+                    } else {
+                        currentCrossfade = CONFIG.crossfadeDur;
+                    }
+
                     if (safeMode === 'NEWS') { fadeOutEndTime = Date.now() / 1000; } 
-                    else { fadeOutEndTime = (Date.now() / 1000) + CONFIG.crossfadeDur; }
+                    else { fadeOutEndTime = (Date.now() / 1000) + currentCrossfade; }
                     safePlay(activeDeck); 
                     if (isTtsActive) startTtsVoice(); 
                 };
@@ -536,7 +555,6 @@
         }
 
         function updateScheduleUI() {
-           // Mantiene la actualización lógica para evitar errores silenciosos
         }
 
         function visualLoop() { 
@@ -556,42 +574,33 @@
         const uiPlayer = document.getElementById('native-ui');
         uiPlayer.volume = 0.9; 
         
-        // Creamos un stream falso a través del Web Audio API. 
-        // Genera silencio para que el navegador lo reconozca como un entorno de "Transmisión en directo" (Live)
         let dummyCtx = new (window.AudioContext || window.webkitAudioContext)();
         let streamDest = dummyCtx.createMediaStreamDestination();
         let osc = dummyCtx.createOscillator();
         let gain = dummyCtx.createGain();
-        gain.gain.value = 0; // Volumen 0 absoluto
+        gain.gain.value = 0; 
         osc.connect(gain);
         gain.connect(streamDest);
         osc.start();
         
         if ('srcObject' in uiPlayer) {
-            uiPlayer.srcObject = streamDest.stream; // Forzamos el aspecto de un enlace streaming
+            uiPlayer.srcObject = streamDest.stream; 
         } else {
             uiPlayer.src = SILENCE_MP3;
             uiPlayer.loop = true;
         }
 
-        // Interceptamos la interacción del usuario en la pantalla negra
         uiPlayer.addEventListener('play', () => {
             if (dummyCtx.state === 'suspended') dummyCtx.resume();
-            
-            // Si el motor interno estaba apagado, encendemos toda la radio
             if (!systemOn) toggleBroadcast();
         });
 
         uiPlayer.addEventListener('pause', () => {
-            // Si el usuario pausa en la web negra, apagamos la radio de verdad
             if (systemOn) toggleBroadcast();
         });
 
         uiPlayer.addEventListener('volumechange', () => {
-            // Enlazamos el regulador de volumen del reproductor nativo con el Master del código
             userVolume = uiPlayer.muted ? 0 : uiPlayer.volume;
-            
-            // Aplicamos este impacto instantáneamente para reaccionar antes del bucle regular
             let instantVol = userVolume * faderLevel;
             deckA.volume = Math.max(0, Math.min(1, instantVol));
             deckB.volume = Math.max(0, Math.min(1, instantVol));
